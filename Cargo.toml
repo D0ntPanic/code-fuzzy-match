@@ -1,0 +1,15 @@
+[package]
+name = "code-fuzzy-match"
+license = "MIT"
+version = "0.1.0"
+edition = "2021"
+description = "Fuzzy string matching inspired by Visual Studio Code"
+
+[dependencies]
+
+[dev-dependencies]
+criterion = { version = "0.5" }
+
+[[bench]]
+name = "benchmark"
+harness = false
