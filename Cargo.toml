@@ -1,9 +1,10 @@
 [package]
 name = "code-fuzzy-match"
 license = "MIT"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Fuzzy string matching inspired by Visual Studio Code"
+repository = "https://github.com/D0ntPanic/code-fuzzy-match"
 
 [dependencies]
 
