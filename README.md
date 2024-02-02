@@ -16,3 +16,17 @@ so it is not a major hit to the match score to search for a term in the middle o
 string. The algorithm prefers matches that are at the beginning of words in the target
 string, with words treated as they might appear in code (letters following a separator or
 in camel case are treated as a word). Sequential matches are also favored.
+
+## Example usage
+
+```rust
+let mut matcher = code_fuzzy_match::FuzzyMatcher::new();
+let matches = matcher.fuzzy_match("the quick brown fox", "bro fox");
+assert!(matches.is_some());
+let no_match = matcher.fuzzy_match("the quick brown fox", "cat");
+assert!(no_match.is_none());
+
+let high_score = matcher.fuzzy_match("Example string", "example");
+let lower_score = matcher.fuzzy_match("Example string", "str");
+assert!(high_score.unwrap() > lower_score.unwrap());
+```
