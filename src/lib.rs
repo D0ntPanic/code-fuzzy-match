@@ -10,14 +10,256 @@
 //! string. The algorithm prefers matches that are at the beginning of words in the target
 //! string, with words treated as they might appear in code (letters following a separator or
 //! in camel case are treated as a word). Sequential matches are also favored.
+//!
+//! This crate provides a [`FuzzyMatcher`] struct for batch processing in addition to a
+//! [`fuzzy_match`] function for matching a single item.
+//!
+//! # Example usage
+//!
+//! ```
+//! let mut matcher = code_fuzzy_match::FuzzyMatcher::new();
+//! let matches = matcher.fuzzy_match("the quick brown fox", "bro fox");
+//! assert!(matches.is_some());
+//! let no_match = matcher.fuzzy_match("the quick brown fox", "cat");
+//! assert!(no_match.is_none());
+//!
+//! let high_score = matcher.fuzzy_match("Example string", "example");
+//! let lower_score = matcher.fuzzy_match("Example string", "str");
+//! assert!(high_score.unwrap() > lower_score.unwrap());
+//! ```
 
 #![no_std]
 
 extern crate alloc;
 use alloc::vec::Vec;
 
+/// Fuzzy matcher instance. Holds memory for the state of the fuzzy matcher so that
+/// large batches of queries can be processed with minimal allocations. When performing a
+/// large batch of fuzzy match queries, use a common instance of this struct to improve
+/// performance by avoiding extra allocations.
+pub struct FuzzyMatcher {
+    target_chars: Vec<char>,
+    prev_seq_match_counts: Vec<usize>,
+    prev_score: Vec<usize>,
+    seq_match_counts: Vec<usize>,
+    score: Vec<usize>,
+}
+
+impl FuzzyMatcher {
+    /// Creates a new instance of a fuzzy matcher.
+    pub fn new() -> Self {
+        FuzzyMatcher {
+            target_chars: Vec::new(),
+            prev_seq_match_counts: Vec::new(),
+            prev_score: Vec::new(),
+            seq_match_counts: Vec::new(),
+            score: Vec::new(),
+        }
+    }
+
+    /// Fuzzy match a string against a query string. Returns a score that is higher for
+    /// a more confident match, or `None` if the query does not match the target string.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut matcher = code_fuzzy_match::FuzzyMatcher::new();
+    /// let matches = matcher.fuzzy_match("the quick brown fox", "bro fox");
+    /// assert!(matches.is_some());
+    /// let no_match = matcher.fuzzy_match("the quick brown fox", "cat");
+    /// assert!(no_match.is_none());
+    ///
+    /// let high_score = matcher.fuzzy_match("Example string", "example");
+    /// let lower_score = matcher.fuzzy_match("Example string", "str");
+    /// assert!(high_score.unwrap() > lower_score.unwrap());
+    /// ```
+    pub fn fuzzy_match(&mut self, target: &str, query: &str) -> Option<usize> {
+        // Break the target string into a vector of characters, since we need to manage
+        // parallel vectors with information per character.
+        self.target_chars.clear();
+        self.target_chars.extend(target.chars());
+
+        // Create vectors holding the score and sequential counts for two query characters.
+        // This algorithm implements a matrix-based method of fuzzy matching, but we don't
+        // need to hold the entire matrix in memory, just the current and previous rows.
+        self.prev_seq_match_counts.clear();
+        self.prev_score.clear();
+        self.prev_seq_match_counts
+            .resize(self.target_chars.len(), 0);
+        self.prev_score.resize(self.target_chars.len(), 0);
+
+        self.seq_match_counts.clear();
+        self.score.clear();
+        self.seq_match_counts.resize(self.target_chars.len(), 0);
+        self.score.resize(self.target_chars.len(), 0);
+
+        let mut first_possible_target_idx: usize = 0;
+
+        // Compute match scores for each query character in sequence
+        let mut first_query_char = true;
+        for query_char in query.chars() {
+            // If the starting point of the search is beyond the end of the target string,
+            // we can't have a match.
+            if first_possible_target_idx >= self.target_chars.len() {
+                return None;
+            }
+
+            // Reset vector holding the score and sequential counts for this query character.
+            // This algorithm implements a matrix-based method of fuzzy matching, but we don't
+            // need to hold the entire matrix in memory, just the current and previous rows.
+            (&mut self.seq_match_counts[first_possible_target_idx..self.target_chars.len()])
+                .fill(0);
+            (&mut self.score[first_possible_target_idx..self.target_chars.len()]).fill(0);
+
+            let mut first_nonzero_score = None;
+            let mut prev_is_separator = false;
+
+            // Compute match scores for each target character in sequence, for this query character.
+            // Start at the character after the previous earliest character that had a score. Any
+            // character before that cannot have a score, so we don't need to check those.
+            for i in first_possible_target_idx..self.target_chars.len() {
+                // Get characters and the score for the previous character in the target
+                let target_char = self.target_chars[i];
+                let target_separator =
+                    matches!(target_char, '_' | '-' | '.' | ' ' | '\'' | '"' | ':');
+                let prev_target_score = if i == first_possible_target_idx {
+                    0
+                } else {
+                    self.score[i - 1]
+                };
+
+                // Previous score and sequential match count comes from the previous character
+                // in both the target and the query
+                let prev_query_score = if i == 0 { 0 } else { self.prev_score[i - 1] };
+                let seq_match_count = if i == 0 {
+                    0
+                } else {
+                    self.prev_seq_match_counts[i - 1]
+                };
+
+                if !first_query_char && prev_query_score == 0 {
+                    self.score[i] = prev_target_score;
+                    prev_is_separator = target_separator;
+                    continue;
+                }
+
+                // Check to ensure the characters match at all. Treat slashes and backslashes
+                // as the same character to be able to use as a path matching function.
+                let char_matches = match target_char {
+                    '/' => matches!(query_char, '/' | '\\'),
+                    '\\' => matches!(query_char, '/' | '\\'),
+                    _ => {
+                        // The `eq_ignore_ascii_case` function is *much* faster than a full
+                        // Unicode case-insensitive comparison, so if the target character is
+                        // ASCII, optimize for performance.
+                        if target_char.is_ascii() {
+                            target_char.eq_ignore_ascii_case(&query_char)
+                        } else {
+                            target_char
+                                .to_lowercase()
+                                .zip(query_char.to_lowercase())
+                                .all(|(a, b)| a == b)
+                        }
+                    }
+                };
+                if !char_matches {
+                    // No match, use existing score and reset sequential count
+                    self.score[i] = prev_target_score;
+                    prev_is_separator = target_separator;
+                    continue;
+                }
+
+                // Compute score for this character match. These bonuses are inspired by
+                // the algorithm used by Visual Studio Code.
+                let mut char_score = 1;
+
+                // Sequential match bonus
+                char_score += seq_match_count * 5;
+
+                if target_char == query_char {
+                    // Same case bonus
+                    char_score += 1;
+                }
+
+                if i == 0 {
+                    // Start of target bonus
+                    char_score += 8;
+                } else {
+                    if matches!(target_char, '/' | '\\') {
+                        // Path separator bonus
+                        char_score += 5;
+                    } else if target_separator {
+                        // Separator bonus
+                        char_score += 4;
+                    } else if prev_is_separator && seq_match_count == 0 {
+                        // Start of word after separator bonus
+                        char_score += 2;
+                    } else if target_char.is_ascii() {
+                        // It is faster to check for ASCII first and then use
+                        // `is_ascii_uppercase` than to always use `is_uppercase`.
+                        if target_char.is_ascii_uppercase() {
+                            // Start of word bonus
+                            char_score += 2;
+                        }
+                    } else if target_char.is_uppercase() {
+                        // Start of word bonus
+                        char_score += 2;
+                    }
+                }
+
+                prev_is_separator = target_separator;
+
+                // Compute new score and check if it's improved
+                let new_score = prev_query_score + char_score;
+                if new_score >= prev_target_score {
+                    // Score is at least the previous score, keep sequential match going
+                    self.score[i] = new_score;
+                    self.seq_match_counts[i] = seq_match_count;
+                    if first_nonzero_score.is_none() {
+                        first_nonzero_score = Some(i);
+                    }
+                } else {
+                    // Score is lower than the previous score, don't use this match
+                    self.score[i] = prev_target_score;
+                }
+            }
+
+            if let Some(first_nonzero_score) = first_nonzero_score {
+                // Start the next character's matching at the character following the one that
+                // first set a valid score.
+                first_possible_target_idx = first_nonzero_score + 1;
+
+                // Keep scores and sequential match information for this character in the query
+                // for lookup during the next character.
+                (&mut self.prev_score[first_nonzero_score..self.target_chars.len()])
+                    .copy_from_slice(&self.score[first_nonzero_score..self.target_chars.len()]);
+                (&mut self.prev_seq_match_counts[first_nonzero_score..self.target_chars.len()])
+                    .copy_from_slice(
+                        &self.seq_match_counts[first_nonzero_score..self.target_chars.len()],
+                    );
+                first_query_char = false;
+            } else {
+                // If the all scores are zero, we already know we don't have a match. Exit early
+                // in this case.
+                return None;
+            }
+        }
+
+        // Final score will always be in the last slot of the final score vector
+        let score = *self.prev_score.last().unwrap_or(&0);
+        if score == 0 {
+            // Score of zero is not a match
+            None
+        } else {
+            Some(score)
+        }
+    }
+}
+
 /// Fuzzy match a string against a query string. Returns a score that is higher for
 /// a more confident match, or `None` if the query does not match the target string.
+///
+/// When performing a large batch of fuzzy matches, use [`FuzzyMatcher`] instead.
 ///
 /// # Examples
 ///
@@ -32,154 +274,8 @@ use alloc::vec::Vec;
 /// assert!(high_score.unwrap() > lower_score.unwrap());
 /// ```
 pub fn fuzzy_match(target: &str, query: &str) -> Option<usize> {
-    // Break the target string into a vector of characters, since we need to manage
-    // parallel vectors with information per character.
-    let target_chars = target.chars().collect::<Vec<char>>();
-
-    // Create vectors holding the score and sequential counts for two query characters.
-    // This algorithm implements a matrix-based method of fuzzy matching, but we don't
-    // need to hold the entire matrix in memory, just the current and previous rows.
-    let mut prev_seq_match_counts = Vec::new();
-    let mut prev_score: Vec<usize> = Vec::new();
-    prev_seq_match_counts.resize(target_chars.len(), 0);
-    prev_score.resize(target_chars.len(), 0);
-
-    let mut seq_match_counts = Vec::new();
-    let mut score: Vec<usize> = Vec::new();
-    seq_match_counts.resize(target_chars.len(), 0);
-    score.resize(target_chars.len(), 0);
-
-    let mut first_possible_target_idx: usize = 0;
-
-    // Compute match scores for each query character in sequence
-    let mut first_query_char = true;
-    for query_char in query.chars() {
-        // If the starting point of the search is beyond the end of the target string,
-        // we can't have a match.
-        if first_possible_target_idx >= target_chars.len() {
-            return None;
-        }
-
-        // Reset vector holding the score and sequential counts for this query character.
-        // This algorithm implements a matrix-based method of fuzzy matching, but we don't
-        // need to hold the entire matrix in memory, just the current and previous rows.
-        seq_match_counts.fill(0);
-        score.fill(0);
-
-        let mut first_nonzero_score = None;
-        let mut prev_is_separator = false;
-
-        // Compute match scores for each target character in sequence, for this query character.
-        // Start at the character after the previous earliest character that had a score. Any
-        // character before that cannot have a score, so we don't need to check those.
-        for i in first_possible_target_idx..target_chars.len() {
-            // Get characters and the score for the previous character in the target
-            let target_char = target_chars[i];
-            let target_separator = matches!(target_char, '_' | '-' | '.' | ' ' | '\'' | '"' | ':');
-            let prev_target_score = if i == 0 { 0 } else { score[i - 1] };
-
-            // Previous score and sequential match count comes from the previous character
-            // in both the target and the query
-            let prev_query_score = if i == 0 { 0 } else { prev_score[i - 1] };
-            let seq_match_count = if i == 0 {
-                0
-            } else {
-                prev_seq_match_counts[i - 1]
-            };
-
-            if !first_query_char && prev_query_score == 0 {
-                score[i] = prev_target_score;
-                prev_is_separator = target_separator;
-                continue;
-            }
-
-            // Check to ensure the characters match at all. Treat slashes and backslashes
-            // as the same character to be able to use as a path matching function.
-            let char_matches = match target_char {
-                '/' => matches!(query_char, '/' | '\\'),
-                '\\' => matches!(query_char, '/' | '\\'),
-                _ => target_char
-                    .to_lowercase()
-                    .zip(query_char.to_lowercase())
-                    .all(|(a, b)| a == b),
-            };
-            if !char_matches {
-                // No match, use existing score and reset sequential count
-                score[i] = prev_target_score;
-                prev_is_separator = target_separator;
-                continue;
-            }
-
-            // Compute score for this character match. These bonuses are inspired by
-            // the algorithm used by Visual Studio Code.
-            let mut char_score = 1;
-
-            // Sequential match bonus
-            char_score += seq_match_count * 5;
-
-            if target_char == query_char {
-                // Same case bonus
-                char_score += 1;
-            }
-
-            if i == 0 {
-                // Start of target bonus
-                char_score += 8;
-            } else {
-                if matches!(target_char, '/' | '\\') {
-                    // Path separator bonus
-                    char_score += 5;
-                } else if target_separator {
-                    // Separator bonus
-                    char_score += 4;
-                } else if target_char.is_uppercase() || prev_is_separator && seq_match_count == 0 {
-                    // Start of word bonus
-                    char_score += 2;
-                }
-            }
-
-            prev_is_separator = target_separator;
-
-            // Compute new score and check if it's improved
-            let new_score = prev_query_score + char_score;
-            if new_score >= prev_target_score {
-                // Score is at least the previous score, keep sequential match going
-                score[i] = new_score;
-                seq_match_counts[i] = seq_match_count;
-                if first_nonzero_score.is_none() {
-                    first_nonzero_score = Some(i);
-                }
-            } else {
-                // Score is lower than the previous score, don't use this match
-                score[i] = prev_target_score;
-            }
-        }
-
-        if let Some(first_nonzero_score) = first_nonzero_score {
-            // Keep scores and sequential match information for this character in the query
-            // for lookup during the next character.
-            prev_score.copy_from_slice(&score);
-            prev_seq_match_counts.copy_from_slice(&seq_match_counts);
-            first_query_char = false;
-
-            // Start the next character's matching at the character following the one that
-            // first set a valid score.
-            first_possible_target_idx = first_nonzero_score + 1;
-        } else {
-            // If the all scores are zero, we already know we don't have a match. Exit early
-            // in this case.
-            return None;
-        }
-    }
-
-    // Final score will always be in the last slot of the final score vector
-    let score = *prev_score.last().unwrap_or(&0);
-    if score == 0 {
-        // Score of zero is not a match
-        None
-    } else {
-        Some(score)
-    }
+    let mut matcher = FuzzyMatcher::new();
+    matcher.fuzzy_match(target, query)
 }
 
 #[cfg(test)]
