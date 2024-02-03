@@ -191,20 +191,27 @@ impl FuzzyMatcher {
                     } else if target_separator {
                         // Separator bonus
                         char_score += 4;
-                    } else if prev_is_separator && seq_match_count == 0 {
-                        // Start of word after separator bonus
-                        char_score += 2;
-                    } else if target_char.is_ascii() {
-                        // It is faster to check for ASCII first and then use
-                        // `is_ascii_uppercase` than to always use `is_uppercase`.
-                        if target_char.is_ascii_uppercase() {
+                    } else if seq_match_count == 0 {
+                        if prev_is_separator {
+                            // Start of word after separator bonus
+                            char_score += 2;
+                        } else if target_char.is_ascii() {
+                            // It is faster to check for ASCII first and then use
+                            // `is_ascii_uppercase` than to always use `is_uppercase`.
+                            if target_char.is_ascii_uppercase() {
+                                // Start of word bonus
+                                char_score += 2;
+                            }
+                        } else if target_char.is_uppercase() {
                             // Start of word bonus
                             char_score += 2;
                         }
-                    } else if target_char.is_uppercase() {
-                        // Start of word bonus
-                        char_score += 2;
                     }
+                }
+
+                if i + 1 == self.target_chars.len() {
+                    // End of target bonus
+                    char_score += 2;
                 }
 
                 prev_is_separator = target_separator;
@@ -214,7 +221,7 @@ impl FuzzyMatcher {
                 if new_score >= prev_target_score {
                     // Score is at least the previous score, keep sequential match going
                     self.score[i] = new_score;
-                    self.seq_match_counts[i] = seq_match_count;
+                    self.seq_match_counts[i] = seq_match_count + 1;
                     if first_nonzero_score.is_none() {
                         first_nonzero_score = Some(i);
                     }
@@ -316,9 +323,9 @@ mod tests {
             "the",          // Matches first word but not a case match, lower than "The"
             "fx over",      // Match with omitted letter
             "quick cat",    // Not a match, last word not present
-            "The quick",    // Long case match at the start, this should be near the top
+            "The quick",    // Long case match at the start, this should be highest
             "the quick",    // Long match at the start, this should be just below "The quick"
-            "jump the dog", // Long match, highest because of three exact word matches
+            "jump the dog", // Long match, high because of three exact word matches
             "jmp the do",   // Match, but not as high as "jump the dog"
             "jmp the cat",  // Not a match, last word not present
             "dog the fox",  // Not a match, out of order
@@ -347,17 +354,17 @@ mod tests {
                 &"xz",
                 &"ee",
                 &"fx",
-                &"JUMP",
-                &"fox",
                 &"het",
-                &"jump",
+                &"fox",
                 &"the",
                 &"The",
+                &"JUMP",
+                &"jump",
                 &"fx over",
-                &"the quick",
-                &"The quick",
                 &"jmp the do",
                 &"jump the dog",
+                &"the quick",
+                &"The quick",
             ]
         );
     }
@@ -376,8 +383,8 @@ mod tests {
 
     #[test]
     fn test_word_bonus() {
-        let higher = crate::fuzzy_match("words with spaces", "wit");
-        let lower = crate::fuzzy_match("words with spaces", "ith");
+        let higher = crate::fuzzy_match("words with spaces", "spa");
+        let lower = crate::fuzzy_match("words with spaces", "pac");
         assert!(higher.is_some());
         assert!(lower.is_some());
         assert!(
@@ -387,8 +394,8 @@ mod tests {
             lower
         );
 
-        let higher = crate::fuzzy_match("words_with_underscores", "wit");
-        let lower = crate::fuzzy_match("words_with_underscores", "ith");
+        let higher = crate::fuzzy_match("words_with_underscores", "und");
+        let lower = crate::fuzzy_match("words_with_underscores", "nde");
         assert!(higher.is_some());
         assert!(lower.is_some());
         assert!(
@@ -398,8 +405,8 @@ mod tests {
             lower
         );
 
-        let higher = crate::fuzzy_match("camelCaseWords", "Cas");
-        let lower = crate::fuzzy_match("camelCaseWords", "ase");
+        let higher = crate::fuzzy_match("camelCaseWords", "Wor");
+        let lower = crate::fuzzy_match("camelCaseWords", "ord");
         assert!(higher.is_some());
         assert!(lower.is_some());
         assert!(

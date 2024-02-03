@@ -1,5 +1,5 @@
 use code_fuzzy_match::fuzzy_match;
-use rand::{random, Rng, thread_rng};
+use rand::{random, thread_rng, Rng};
 
 fn random_string(min_length: usize, max_length: usize) -> String {
     let length = thread_rng().gen_range(min_length..=max_length);
