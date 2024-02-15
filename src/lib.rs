@@ -39,10 +39,33 @@ use alloc::vec::Vec;
 /// performance by avoiding extra allocations.
 pub struct FuzzyMatcher {
     target_chars: Vec<char>,
+    first_possible_match: Vec<usize>,
     prev_seq_match_counts: Vec<usize>,
     prev_score: Vec<usize>,
     seq_match_counts: Vec<usize>,
     score: Vec<usize>,
+}
+
+fn char_matches(query_char: char, target_char: char) -> bool {
+    // Treat slashes and backslashes as the same character to be able to use as a path
+    // matching function.
+    match query_char {
+        '/' => matches!(target_char, '/' | '\\'),
+        '\\' => matches!(target_char, '/' | '\\'),
+        _ => {
+            // The `eq_ignore_ascii_case` function is *much* faster than a full
+            // Unicode case-insensitive comparison, so if the target character is
+            // ASCII, optimize for performance.
+            if query_char.is_ascii() {
+                query_char.eq_ignore_ascii_case(&target_char)
+            } else {
+                query_char
+                    .to_lowercase()
+                    .zip(target_char.to_lowercase())
+                    .all(|(a, b)| a == b)
+            }
+        }
+    }
 }
 
 impl FuzzyMatcher {
@@ -50,6 +73,7 @@ impl FuzzyMatcher {
     pub fn new() -> Self {
         FuzzyMatcher {
             target_chars: Vec::new(),
+            first_possible_match: Vec::new(),
             prev_seq_match_counts: Vec::new(),
             prev_score: Vec::new(),
             seq_match_counts: Vec::new(),
@@ -75,9 +99,31 @@ impl FuzzyMatcher {
     /// ```
     pub fn fuzzy_match(&mut self, target: &str, query: &str) -> Option<usize> {
         // Break the target string into a vector of characters, since we need to manage
-        // parallel vectors with information per character.
+        // parallel vectors with information per character. Match query string characters
+        // along the way to perform an early exit if the query string definitely does not
+        // match, as well as computing the earliest possible index for each given query
+        // character.
         self.target_chars.clear();
         self.target_chars.extend(target.chars());
+        self.first_possible_match.clear();
+        let mut query_chars = query.chars();
+        let mut cur_query_char = query_chars.next();
+        for (target_idx, target_char) in target.chars().enumerate() {
+            if let Some(query_char) = cur_query_char {
+                if char_matches(query_char, target_char) {
+                    self.first_possible_match.push(target_idx);
+                    cur_query_char = query_chars.next();
+                }
+            }
+        }
+
+        // If we didn't consume all query characters, then the query is not a match.
+        if cur_query_char.is_some() {
+            return None;
+        }
+
+        debug_assert_eq!(target.chars().count(), self.target_chars.len());
+        debug_assert_eq!(query.chars().count(), self.first_possible_match.len());
 
         // Create vectors holding the score and sequential counts for two query characters.
         // This algorithm implements a matrix-based method of fuzzy matching, but we don't
@@ -97,12 +143,18 @@ impl FuzzyMatcher {
 
         // Compute match scores for each query character in sequence
         let mut first_query_char = true;
-        for query_char in query.chars() {
+        for (query_char, first_possible_match) in
+            query.chars().zip(self.first_possible_match.iter())
+        {
             // If the starting point of the search is beyond the end of the target string,
             // we can't have a match.
             if first_possible_target_idx >= self.target_chars.len() {
                 return None;
             }
+
+            // If the initial scan saw that the first possible match for this query character
+            // is later in the string, use that instead.
+            first_possible_target_idx = first_possible_target_idx.max(*first_possible_match);
 
             // Reset vector holding the score and sequential counts for this query character.
             // This algorithm implements a matrix-based method of fuzzy matching, but we don't
@@ -112,7 +164,6 @@ impl FuzzyMatcher {
             (&mut self.score[first_possible_target_idx..self.target_chars.len()]).fill(0);
 
             let mut first_nonzero_score = None;
-            let mut prev_is_separator = false;
 
             // Compute match scores for each target character in sequence, for this query character.
             // Start at the character after the previous earliest character that had a score. Any
@@ -120,8 +171,6 @@ impl FuzzyMatcher {
             for i in first_possible_target_idx..self.target_chars.len() {
                 // Get characters and the score for the previous character in the target
                 let target_char = self.target_chars[i];
-                let target_separator =
-                    matches!(target_char, '_' | '-' | '.' | ' ' | '\'' | '"' | ':');
                 let prev_target_score = if i == first_possible_target_idx {
                     0
                 } else {
@@ -139,33 +188,13 @@ impl FuzzyMatcher {
 
                 if !first_query_char && prev_query_score == 0 {
                     self.score[i] = prev_target_score;
-                    prev_is_separator = target_separator;
                     continue;
                 }
 
-                // Check to ensure the characters match at all. Treat slashes and backslashes
-                // as the same character to be able to use as a path matching function.
-                let char_matches = match target_char {
-                    '/' => matches!(query_char, '/' | '\\'),
-                    '\\' => matches!(query_char, '/' | '\\'),
-                    _ => {
-                        // The `eq_ignore_ascii_case` function is *much* faster than a full
-                        // Unicode case-insensitive comparison, so if the target character is
-                        // ASCII, optimize for performance.
-                        if target_char.is_ascii() {
-                            target_char.eq_ignore_ascii_case(&query_char)
-                        } else {
-                            target_char
-                                .to_lowercase()
-                                .zip(query_char.to_lowercase())
-                                .all(|(a, b)| a == b)
-                        }
-                    }
-                };
-                if !char_matches {
+                // Check to ensure the characters match at all.
+                if !char_matches(query_char, target_char) {
                     // No match, use existing score and reset sequential count
                     self.score[i] = prev_target_score;
-                    prev_is_separator = target_separator;
                     continue;
                 }
 
@@ -188,11 +217,16 @@ impl FuzzyMatcher {
                     if matches!(target_char, '/' | '\\') {
                         // Path separator bonus
                         char_score += 5;
-                    } else if target_separator {
+                    } else if matches!(target_char, '_' | '-' | '.' | ' ' | '\'' | '"' | ':') {
                         // Separator bonus
                         char_score += 4;
                     } else if seq_match_count == 0 {
-                        if prev_is_separator {
+                        if i > 0
+                            && matches!(
+                                self.target_chars[i - 1],
+                                '_' | '-' | '.' | ' ' | '\'' | '"' | ':'
+                            )
+                        {
                             // Start of word after separator bonus
                             char_score += 2;
                         } else if target_char.is_ascii() {
@@ -213,8 +247,6 @@ impl FuzzyMatcher {
                     // End of target bonus
                     char_score += 2;
                 }
-
-                prev_is_separator = target_separator;
 
                 // Compute new score and check if it's improved
                 let new_score = prev_query_score + char_score;
